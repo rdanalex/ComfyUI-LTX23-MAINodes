@@ -132,17 +132,39 @@ def main():
                  reference=None, reference_mix=1.0)
     print("PASS warning path executed (see console line above)")
 
+    # LTX23AudioSmear tests
+    smear_node = m.LTX23AudioSmear()
     try:
-        node.recover({"waveform": wav, "sample_rate": SR}, "")
+        smear_node.smear({"waveform": wav_world, "sample_rate": SR}, "")
     except ValueError as e:
-        print(f"PASS empty-hold-map guard: {e}")
+        print(f"PASS smear empty-hold-map guard: {e}")
     else:
-        raise AssertionError("empty hold_map should raise")
+        raise AssertionError("empty hold_map should raise in smear")
+
+    out_s, = smear_node.smear({"waveform": wav_world, "sample_rate": SR}, hm, fps=24)
+    got_s = out_s["waveform"].shape[-1]
+    expected_s = sum(int(round(h * c * (SR / 24))) for h, c in runs)
+    assert abs(got_s - expected_s) <= expected_s // 100, \
+        f"smear length {got_s} != expected dilated length {expected_s}"
+    print(f"PASS LTX23AudioSmear: world {wav_world.shape[-1]} samples -> dilated {got_s} samples "
+          f"({got_s / SR:.3f} s, target {expected_s})")
+
+    # Roundtrip: world audio -> smear -> recover -> world audio
+    out_roundtrip, = node.recover(out_s, hm, fps=24, fps_mode="auto (detect audio clock)",
+                                  reference=None, reference_mix=0.0)
+    got_rt = out_roundtrip["waveform"].shape[-1]
+    world_len = wav_world.shape[-1]
+    assert abs(got_rt - world_len) <= world_len // 100, \
+        f"roundtrip length {got_rt} != original world length {world_len}"
+    print(f"PASS roundtrip (smear -> recover): {world_len} -> {got_s} -> {got_rt} samples "
+          f"(within 1% of world clock)")
 
     # registration sanity
     assert "LTX23AudioRecover" in m.NODE_CLASS_MAPPINGS
     assert m.NODE_DISPLAY_NAME_MAPPINGS["LTX23AudioRecover"] == "LTX 2.3 Audio Recover"
-    print("PASS registration: node is in NODE_CLASS_MAPPINGS")
+    assert "LTX23AudioSmear" in m.NODE_CLASS_MAPPINGS
+    assert m.NODE_DISPLAY_NAME_MAPPINGS["LTX23AudioSmear"] == "LTX 2.3 Audio Smear"
+    print("PASS registration: all nodes in NODE_CLASS_MAPPINGS")
 
     print("ALL PASS")
 
