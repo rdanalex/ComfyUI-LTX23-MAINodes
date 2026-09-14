@@ -687,9 +687,14 @@ class LTX23AudioRecover:
                 "default": "",
                 "tooltip": "hold_map_used from the same LTX23TimeSmear node (NOT the raw LTX23JerkOracle.hold_map - the smear aligns it to the image batch and snaps the tail to the legal 8k+1 grid, so the audio must retime off the SAME map the video used).",
             }),
-            "fps_mode": (["auto (match audio to hold map)", "manual (use fps below)"],
-                {"default": "auto (match audio to hold map)",
-                 "tooltip": "auto derives samples-per-frame from the decoded audio's ACTUAL length and the hold map, so the retime stays in sync even if the fps widget or the decode clock is off. Manual uses fps verbatim and reports any mismatch."}),
+            "fps_mode": ([
+                "auto (detect audio clock)",
+                "audio is dilated (retime by hold map)",
+                "audio is world-rate (passthrough)",
+                "manual fps (assume dilated)",
+            ],
+                {"default": "auto (detect audio clock)",
+                 "tooltip": "auto measures the decoded audio against BOTH clock the map implies - the DILATED duration (sum(holds)/fps, what a regenerated AV latent should produce when pass 2's audio rows were stretched) and the WORLD duration (len(holds)/fps, what you get when pass 2's audio rows were seeded from pass 1's own world-rate audio, as LTXVConcatAVLatent does NOT stretch audio tokens) - and retimes only when the audio really is dilated. If the audio is already world-rate it is passed through untouched; compressing world-rate audio is what used to cut the sound short after a few seconds. The explicit modes force a behaviour; manual assumes a dilated clock at the fps given below."}),
             "fps": ("INT", {"default": 25, "min": 1, "max": 120,
                             "tooltip": "Used only in manual fps_mode. Must equal the frame rate of the LTX generation (25 for 25fps renders, 50 for 50fps renders)."}),
         }, "optional": {
@@ -738,131 +743,159 @@ class LTX23AudioRecover:
         b, c, n = wav.shape
         x = wav.reshape(b * c, n)
 
-        # Clock discipline. The retiming assumes the audio's samples-per-frame
-        # equals sr/fps. Two things break that in an LTX pipeline: the fps
-        # widget not matching the render rate, and LTX's audio decoder
-        # emitting on its own clock (its duration is a latent-token multiple,
-        # not exactly sum(holds)/fps). Auto mode derives spf from the ACTUAL
-        # waveform length: n samples cover total_holds world frames, so
-        # spf = n/total_holds. That guarantees the run boundaries inside the
-        # waveform land where the map says, whatever the decode clock did.
-        # Manual mode uses sr/fps verbatim and reports any drift.
+        # Clock discipline. The retime is only valid if the decoded audio
+        # actually lives on the DILATED clock (sum(holds) frames): pass 2's
+        # audio rows must have been stretched when the AV latent was built.
+        # In pipelines where pass 2's audio rows come from pass 1's own
+        # world-rate output (LTXVConcatAVLatent does NOT stretch audio
+        # tokens), the decoded audio is already on the WORLD clock
+        # (len(holds) frames) and compressing it by the hold factor cuts it
+        # short - the historical "sound gone after a few seconds" failure.
+        # So: measure the audio against both implied durations and decide.
         # Legacy guard: a workflow saved with an older node layout can hand
         # this method mangled widget values (e.g. a bare int landed on
-        # fps_mode by positional mapping). Anything that is not the manual
-        # label falls back to the safe auto clock instead of crashing or
-        # running on a nonsense clock.
-        manual = isinstance(fps_mode, str) and "manual" in fps_mode
+        # fps_mode by positional mapping); anything unrecognized falls back
+        # to the safe auto-detect.
         try:
             fps = max(1, min(120, int(fps)))
         except (TypeError, ValueError):
             fps = 25
-        spf = sr / float(fps) if manual else n / float(total_holds)
-        expected = total_holds * spf
-        drift_ms = (n - expected) / sr * 1000.0
-        eff_fps = sr / spf
-        if manual and abs(drift_ms) > 20.0:
-            print(f"[LTX23AudioRecover] WARNING: audio is {n} samples "
-                  f"({n / sr:.3f} s) but the hold map at fps={fps} expects "
-                  f"{int(round(expected))} samples ({expected / sr:.3f} s): "
-                  f"{drift_ms:+.1f} ms drift. Every segment boundary is "
-                  f"misplaced - this desyncs lipsync. Either use fps_mode=auto "
-                  f"or set fps to {eff_fps:.3f} (the render's real rate)")
-        elif manual:
-            print(f"[LTX23AudioRecover] clock OK: audio {n / sr:.3f} s vs map "
-                  f"{expected / sr:.3f} s at fps={fps} ({drift_ms:+.1f} ms)")
-        else:
-            if abs(spf - sr / float(fps)) > 0.02 * sr / float(fps):
-                print(f"[LTX23AudioRecover] auto clock: decoded audio implies "
-                      f"fps={eff_fps:.3f}, not the widget's {fps}; using the "
-                      f"audio's own clock so segments land on the map")
+        mode = fps_mode if isinstance(fps_mode, str) else ""
+        world_samples = len(holds) * sr / float(fps)
+        dilated_samples = total_holds * sr / float(fps)
+        tol = max(0.02 * n, int(0.05 * sr))          # 2% of track or 50 ms
+        fits_world = abs(n - world_samples) <= tol
+        fits_dilated = abs(n - dilated_samples) <= tol
+
+        if "world-rate" in mode:                     # explicit passthrough
+            clock, retime = "forced world-rate (passthrough)", False
+            if fits_dilated and not fits_world:
+                print(f"[LTX23AudioRecover] WARNING: forced passthrough but "
+                      f"the audio ({n / sr:.3f} s) matches the DILATED "
+                      f"duration ({dilated_samples / sr:.3f} s), not the "
+                      f"world duration ({world_samples / sr:.3f} s) - the "
+                      f"output will lag the recovered video by the hold "
+                      f"factor. Use auto or the dilated mode")
+        elif "dilated" in mode and "manual" not in mode:   # force retime
+            clock, retime = "forced dilated (retime)", True
+            if fits_world and not fits_dilated:
+                print(f"[LTX23AudioRecover] WARNING: forced retime but the "
+                      f"audio ({n / sr:.3f} s) matches the WORLD duration "
+                      f"({world_samples / sr:.3f} s), not the dilated one "
+                      f"({dilated_samples / sr:.3f} s) - compressing "
+                      f"world-rate audio cuts it short. Use auto or the "
+                      f"passthrough mode")
+        elif "manual" in mode:
+            clock, retime = f"manual (assumed dilated @ fps={fps})", True
+            spf = sr / float(fps)
+        else:                                        # auto-detect
+            if fits_world and fits_dilated:
+                # avg hold ~1: the two clocks coincide, either is identity
+                clock, retime = "auto: world==dilated (passthrough)", False
+            elif fits_world:
+                clock, retime = (
+                    f"auto: audio is WORLD-rate ({n / sr:.3f} s ~ "
+                    f"{world_samples / sr:.3f} s, dilated would be "
+                    f"{dilated_samples / sr:.3f} s) - passthrough, no retime",
+                    False)
+            elif fits_dilated:
+                clock, retime = (
+                    f"auto: audio is DILATED ({n / sr:.3f} s ~ "
+                    f"{dilated_samples / sr:.3f} s, world would be "
+                    f"{world_samples / sr:.3f} s) - retime by hold map",
+                    True)
             else:
-                print(f"[LTX23AudioRecover] auto clock: audio {n / sr:.3f} s "
-                      f"matches the map at fps={fps:.3f}")
-        # Wiring sanity: if the audio's duration matches the WORLD clock
-        # (len(holds) frames) instead of the DILATED clock (sum(holds)
-        # frames), this is almost certainly the baseline clip's audio or a
-        # decoded-at-world-rate track - compressing it again double-shrinks
-        # it and destroys lipsync.
-        world_spf = n / float(len(holds))
-        if len(holds) != total_holds and abs(
-                total_holds * world_spf - n) > 0.02 * n:
-            print(f"[LTX23AudioRecover] note: audio duration matches the map's "
-                  f"DILATED clock ({total_holds} frames) - expected for "
-                  f"regenerated audio. If you intended the baseline track, "
-                  f"it would instead be {len(holds) / eff_fps:.3f} s here.")
+                # neither fits: pick the closer clock and say so loudly
+                d_world, d_dil = abs(n - world_samples), abs(n - dilated_samples)
+                retime = d_dil < d_world
+                clock = (f"auto: audio {n / sr:.3f} s matches NEITHER clock "
+                         f"(world {world_samples / sr:.3f} s, dilated "
+                         f"{dilated_samples / sr:.3f} s) - chose the closer "
+                         f"({'dilated, retime' if retime else 'world, passthrough'})")
+                print(f"[LTX23AudioRecover] WARNING: {clock}. Check that "
+                      f"fps={fps} is the render rate and that this audio "
+                      f"comes from VAEDecodeAudio of the REGENERATED latent")
+        if retime and "manual" in mode:
+            spf = sr / float(fps)                    # manual: widget clock
+        elif retime:
+            spf = n / float(total_holds)             # audio's own clock
         print(f"[LTX23AudioRecover] map: {len(holds)} world frames, "
               f"{total_holds} dilated frames (avg x{total_holds / len(holds):.2f}); "
               f"audio: {b * c} ch, {n} samples @ {sr} Hz ({n / sr:.3f} s); "
-              f"clock: {'manual' if manual else 'auto'} spf={spf:.3f} "
-              f"(eff fps {eff_fps:.3f})")
+              f"clock: {clock}"
+              + (f"; spf={spf:.3f}" if retime else ""))
 
-        runs = []                                        # consecutive equal holds
-        for h in holds:
-            if runs and runs[-1][0] == h:
-                runs[-1][1] += 1
-            else:
-                runs.append([h, 1])
+        if not retime:
+            # The audio is already on the world clock: hands off. Retiming
+            # it would compress it by the hold factor and cut it short
+            # (sound "gone" after a few seconds of a 15 s video).
+            y = x
+        else:
+            runs = []                                    # consecutive equal holds
+            for h in holds:
+                if runs and runs[-1][0] == h:
+                    runs[-1][1] += 1
+                else:
+                    runs.append([h, 1])
 
-        n_fft, hop = 2048, 512
-        window = torch.hann_window(n_fft)
-        phase_adv = torch.linspace(0, math.pi * hop, n_fft // 2 + 1)[..., None]
-        # spf was derived above (auto: n/total_holds, manual: sr/fps) and is
-        # the single source of truth for the retiming below. Do NOT recompute
-        # it here from the fps widget — that reintroduces the exact clock
-        # mismatch auto mode exists to prevent.
-        xfade = max(1, int(round(0.005 * sr)))           # 5 ms crossfade
-        segs, joins, cursor = [], [], 0.0
-        prev_tgt = 0
-        for h, count in runs:
-            src = h * count * spf
-            # exact world-clock samples this run must occupy (see MAINodes
-            # motion.py: keeping targets on the rounded world lattice stops
-            # hop-quantized istft errors from accumulating into a drift that
-            # audibly doubles impacts at mid reference_mix values).
-            tgt = int(round(count * spf))
-            s0, s1 = int(round(cursor)), int(round(cursor + src))
-            cursor += src
-            # pre-roll for the crossfade into the previous run: f output
-            # samples cost f*h source samples, taken from BEFORE s0, so both
-            # sides of the join carry the same material at their own rate
-            # and nothing is dropped. It lands ON TOP of the previous
-            # segment's tail, so output length is exactly sum(tgt).
-            f = 0 if not segs else min(xfade, tgt, prev_tgt, s0 // max(h, 1))
-            prev_tgt = tgt
-            seg = x[:, s0 - f * h:min(s1, n)]
-            if seg.shape[1] == 0:
-                # source exhausted: hold the clock with silence instead of
-                # silently shortening every later segment's position
-                segs.append(torch.zeros(x.shape[0], tgt))
-                joins.append(0)
-                continue
-            if h > 1:
-                spec = torch.stft(seg, n_fft, hop, window=window,
-                                  return_complex=True)
-                spec = torchaudio.functional.phase_vocoder(
-                    spec, _vocoder_rate_for(spec, float(h), hop, f + tgt), phase_adv)
-                # length= is load-bearing: without it istft returns a
-                # hop-multiple that falls short of the target and the pad
-                # below appends digital silence at every held run's tail.
-                seg = torch.istft(spec, n_fft, hop, window=window,
-                                  length=f + tgt)
-            if seg.shape[1] < f + tgt:
-                seg = torch.nn.functional.pad(seg, (0, f + tgt - seg.shape[1]))
-            segs.append(seg[:, :f + tgt])
-            joins.append(f)
-        parts = []
-        for seg, f in zip(segs, joins):
-            if f:
-                # equal-power crossfade: the two takes of this material are
-                # retimed at different rates, so they sum incoherently
-                t = torch.arange(1, f + 1, dtype=seg.dtype) / f
-                prev = parts[-1].clone()                 # never write into x
-                prev[:, -f:] = (prev[:, -f:] * torch.cos(t * (math.pi / 2))
-                                + seg[:, :f] * torch.sin(t * (math.pi / 2)))
-                parts[-1] = prev
-            parts.append(seg[:, f:])
-        y = torch.cat(parts, dim=1)
+            n_fft, hop = 2048, 512
+            window = torch.hann_window(n_fft)
+            phase_adv = torch.linspace(0, math.pi * hop, n_fft // 2 + 1)[..., None]
+            # spf was derived above (auto-detect: n/total_holds, manual:
+            # sr/fps) and is the single source of truth for the retiming
+            # below. Do NOT recompute it from the fps widget.
+            xfade = max(1, int(round(0.005 * sr)))       # 5 ms crossfade
+            segs, joins, cursor = [], [], 0.0
+            prev_tgt = 0
+            for h, count in runs:
+                src = h * count * spf
+                # exact world-clock samples this run must occupy (see MAINodes
+                # motion.py: keeping targets on the rounded world lattice stops
+                # hop-quantized istft errors from accumulating into a drift that
+                # audibly doubles impacts at mid reference_mix values).
+                tgt = int(round(count * spf))
+                s0, s1 = int(round(cursor)), int(round(cursor + src))
+                cursor += src
+                # pre-roll for the crossfade into the previous run: f output
+                # samples cost f*h source samples, taken from BEFORE s0, so both
+                # sides of the join carry the same material at their own rate
+                # and nothing is dropped. It lands ON TOP of the previous
+                # segment's tail, so output length is exactly sum(tgt).
+                f = 0 if not segs else min(xfade, tgt, prev_tgt, s0 // max(h, 1))
+                prev_tgt = tgt
+                seg = x[:, s0 - f * h:min(s1, n)]
+                if seg.shape[1] == 0:
+                    # source exhausted: hold the clock with silence instead of
+                    # silently shortening every later segment's position
+                    segs.append(torch.zeros(x.shape[0], tgt))
+                    joins.append(0)
+                    continue
+                if h > 1:
+                    spec = torch.stft(seg, n_fft, hop, window=window,
+                                      return_complex=True)
+                    spec = torchaudio.functional.phase_vocoder(
+                        spec, _vocoder_rate_for(spec, float(h), hop, f + tgt), phase_adv)
+                    # length= is load-bearing: without it istft returns a
+                    # hop-multiple that falls short of the target and the pad
+                    # below appends digital silence at every held run's tail.
+                    seg = torch.istft(spec, n_fft, hop, window=window,
+                                      length=f + tgt)
+                if seg.shape[1] < f + tgt:
+                    seg = torch.nn.functional.pad(seg, (0, f + tgt - seg.shape[1]))
+                segs.append(seg[:, :f + tgt])
+                joins.append(f)
+            parts = []
+            for seg, f in zip(segs, joins):
+                if f:
+                    # equal-power crossfade: the two takes of this material are
+                    # retimed at different rates, so they sum incoherently
+                    t = torch.arange(1, f + 1, dtype=seg.dtype) / f
+                    prev = parts[-1].clone()                 # never write into x
+                    prev[:, -f:] = (prev[:, -f:] * torch.cos(t * (math.pi / 2))
+                                    + seg[:, :f] * torch.sin(t * (math.pi / 2)))
+                    parts[-1] = prev
+                parts.append(seg[:, f:])
+            y = torch.cat(parts, dim=1)
         if reference is None and reference_mix > 0:
             print(f"[LTX23AudioRecover] reference_mix={reference_mix} but no "
                   "reference audio is wired: the mix does NOTHING and the "

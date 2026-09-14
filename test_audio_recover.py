@@ -59,7 +59,7 @@ def main():
         i = int(f * (n_pad / sum(holds)))
         wav_pad[:, :, i:i + 40] = 1.0
     out_a, = node.recover({"waveform": wav_pad, "sample_rate": SR}, hm,
-                          fps=25, fps_mode="auto (match audio to hold map)",
+                          fps=25, fps_mode="auto (detect audio clock)",
                           reference=None, reference_mix=0.0)
     got_a = out_a["waveform"].shape[-1]
     # the decoder pad is distributed proportionally across the map, so the
@@ -73,13 +73,33 @@ def main():
     # the strong invariant: audio whose length matches the dilated clock
     # exactly must retime to the world target exactly.
     out_e, = node.recover({"waveform": wav, "sample_rate": SR}, hm,
-                          fps=25, fps_mode="auto (match audio to hold map)",
+                          fps=25, fps_mode="auto (detect audio clock)",
                           reference=None, reference_mix=0.0)
     assert out_e["waveform"].shape[-1] == expect, (
         f"auto retime of exact-length audio gave "
         f"{out_e['waveform'].shape[-1]} != {expect}")
     print(f"PASS auto clock exact: retimed {out_e['waveform'].shape[-1]} "
           f"== world target {expect}")
+
+    # WORLD-rate audio must be passed through untouched. This reproduces the
+    # reported failure: audio decoded at the world duration (len(holds)/fps
+    # = 15 s for a 361-frame map with 889 dilated frames @ 24 fps) while the
+    # map implies a dilated clock. Old behaviour compressed it to ~40% of
+    # its length ("sound gone after a few seconds"); passthrough must return
+    # every sample.
+    wav_world = torch.zeros(1, 2, int(len(holds) * SR / 24))  # world @ 24 fps
+    for f in range(len(holds)):
+        i = int(f * (SR / 24))
+        wav_world[:, :, i:i + 40] = 1.0
+    out_w, = node.recover({"waveform": wav_world, "sample_rate": SR}, hm,
+                          fps=24, fps_mode="auto (detect audio clock)",
+                          reference=None, reference_mix=0.0)
+    got_w = out_w["waveform"].shape[-1]
+    assert got_w == wav_world.shape[-1], (
+        f"world-rate audio was retimed: {got_w} != "
+        f"{wav_world.shape[-1]} samples (sound-cut-short bug)")
+    print(f"PASS auto detect world-rate: passthrough kept all {got_w} "
+          f"samples ({got_w / SR:.3f} s) - no sound cut short")
 
     # manual mode with a wrong fps must fire the drift warning
     node.recover({"waveform": wav, "sample_rate": SR}, hm, fps=50,
@@ -90,7 +110,7 @@ def main():
     # legacy guard: a workflow saved with the older node layout can deliver
     # a bare int for fps_mode (positional widget mapping). It must fall
     # back to the safe auto clock instead of crashing.
-    out_l, = node.recover({"waveform": wav, "sample_rate": SR}, hm, fps=1,
+    out_l, = node.recover({"waveform": wav, "sample_rate": SR}, hm, fps=25,
                           fps_mode=25, reference=None, reference_mix=0.0)
     assert out_l["waveform"].shape[-1] == expect, \
         f"legacy fps_mode fallback gave {out_l['waveform'].shape[-1]} != {expect}"
