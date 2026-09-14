@@ -747,7 +747,16 @@ class LTX23AudioRecover:
         # spf = n/total_holds. That guarantees the run boundaries inside the
         # waveform land where the map says, whatever the decode clock did.
         # Manual mode uses sr/fps verbatim and reports any drift.
-        manual = fps_mode.startswith("manual")
+        # Legacy guard: a workflow saved with an older node layout can hand
+        # this method mangled widget values (e.g. a bare int landed on
+        # fps_mode by positional mapping). Anything that is not the manual
+        # label falls back to the safe auto clock instead of crashing or
+        # running on a nonsense clock.
+        manual = isinstance(fps_mode, str) and "manual" in fps_mode
+        try:
+            fps = max(1, min(120, int(fps)))
+        except (TypeError, ValueError):
+            fps = 25
         spf = sr / float(fps) if manual else n / float(total_holds)
         expected = total_holds * spf
         drift_ms = (n - expected) / sr * 1000.0
@@ -798,7 +807,10 @@ class LTX23AudioRecover:
         n_fft, hop = 2048, 512
         window = torch.hann_window(n_fft)
         phase_adv = torch.linspace(0, math.pi * hop, n_fft // 2 + 1)[..., None]
-        spf = sr / float(fps)                            # samples per frame
+        # spf was derived above (auto: n/total_holds, manual: sr/fps) and is
+        # the single source of truth for the retiming below. Do NOT recompute
+        # it here from the fps widget — that reintroduces the exact clock
+        # mismatch auto mode exists to prevent.
         xfade = max(1, int(round(0.005 * sr)))           # 5 ms crossfade
         segs, joins, cursor = [], [], 0.0
         prev_tgt = 0
