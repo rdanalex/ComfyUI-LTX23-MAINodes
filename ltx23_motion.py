@@ -4,10 +4,11 @@ The original implementation targets MiniMax/H3's 17k+5 temporal grid and
 24-channel latent layout.  LTX-2.3 instead uses a 128-channel video latent
 with temporal VAE compression of 8x, so legal video lengths are 8k+1.
 
-Only the three nodes requested for LTX-2.3 are included here:
+Only the nodes requested for LTX-2.3 are included here:
     LTX23JerkOracle
     LTX23TimeSmear
     LTX23ExactRecover
+    LTX23AudioRecover
 
 The algorithm itself is intentionally kept close to the original MAINodes
 implementation: jerk/trajectory profile -> quantile threshold -> ramped hold
@@ -611,14 +612,217 @@ class LTX23ExactRecover:
         return (images[torch.tensor(starts, dtype=torch.long)].cpu(),)
 
 
+def _torchaudio(feature):
+    """Import torchaudio lazily with a helpful message (mirrors MAINodes)."""
+    try:
+        import torchaudio
+        return torchaudio
+    except Exception as e:
+        raise ImportError(
+            f"LTX23AudioRecover needs torchaudio for the {feature} op "
+            f"(pip install torchaudio): {e}"
+        )
+
+
+def _vocoder_rate_for(spec, rate, hop, need):
+    """Clamp a phase-vocoder rate so the ISTFT can cover `need` samples.
+
+    Same guard as the original MAINodes implementation: torch.istft(center=True)
+    yields n_frames*hop valid samples, and phase_vocoder emits ceil(n_in/rate)
+    frames. LTX audio latents decode on their own clock, so the last stretched
+    run of a map can also end up with fewer source samples than its frame
+    count implies; without this clamp the ISTFT trips "window overlap add min".
+    """
+    n_in = spec.shape[-1]
+    if n_in <= 0 or need <= 0:
+        return rate
+    return min(float(rate), (n_in * hop) / float(need))
+
+
+class LTX23AudioRecover:
+    """Retime the regenerated LTX clip's jointly-generated audio back to the
+    original clock, using the same hold map as the video.
+
+    LTX-2.3 adaptation of H3 Audio Recover. The retiming math is clock-
+    agnostic (frames x samples-per-frame), so it carries over unchanged;
+    what changes is the contract: hold_map here is the hold_map_used string
+    emitted by LTX23TimeSmear (same JSON the smear snapped to the 8k+1
+    grid), and the node makes no assumption about the 17k+5 grid.
+    """
+
+    DESCRIPTION = (
+        "LTX-2.3 adaptation of H3 Audio Recover. Retimes the regenerated "
+        "clip's own audio back to the original clock, using the same hold "
+        "map as the video. Each hold segment is compressed with a phase "
+        "vocoder, so pitch is preserved while duration shrinks. Wire audio "
+        "from VAEDecodeAudio of the regenerated LTX latent and hold_map_used "
+        "from the same LTX23TimeSmear that built the init; the result lines "
+        "up with LTX23ExactRecover's video frame for frame. fps is the video "
+        "frame rate the holds count in (LTX 2.3/2.5 renders are commonly "
+        "25 or 50 fps - set it to whatever you generated at).\n\n"
+        "Lipsync note: if pass 2's audio rows were NOT seeded, the model "
+        "invented speech at natural rate inside the dilated timeline; this "
+        "node then compresses it by the hold factor and held regions come "
+        "back rushed. In that case blend the original clip's audio back in "
+        "via reference + reference_mix=1.\n\n"
+        "Thickness dial: the regenerated audio is scored for the slowed "
+        "performance, so it comes back leaner than a native-speed mix. Wire "
+        "the baseline clip's audio into reference and raise reference_mix to "
+        "blend its full-speed track back in: 0 keeps the regenerated audio, "
+        "1 is the baseline track alone."
+    )
+
+    SOURCES = {
+        "keep the original performance (safe default)": 1.0,
+        "use pass 2's audio - ONLY IF the audio rows were seeded": 0.0,
+        "blend, favour the original": 0.75,
+        "blend, favour pass 2": 0.25,
+    }
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "audio": ("AUDIO",),
+            "hold_map": ("STRING", {
+                "default": "",
+                "tooltip": "hold_map_used from the same LTX23TimeSmear node.",
+            }),
+            "fps": ("INT", {"default": 25, "min": 1, "max": 120}),
+        }, "optional": {
+            "reference": ("AUDIO", {"tooltip": "baseline clip audio (already real-time)"}),
+            "reference_mix": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0,
+                                        "step": 0.05,
+                                        "tooltip": "1 = the baseline track intact (default: regenerated "
+                                                   "audio quality varies), 0 = regenerated audio only. "
+                                                   "Mid values blend two takes and are happiest near the ends"}),
+            "audio_source": (["custom (use reference_mix)"] + list(cls.SOURCES),
+                {"default": "custom (use reference_mix)",
+                 "tooltip": "plain-language presets; anything but 'custom' overrides reference_mix. "
+                            "WHICH ONE IS RIGHT DEPENDS ON WHETHER PASS 2's AUDIO ROWS WERE SEEDED "
+                            "(LTX23AudioSmear -> VAE Encode Audio -> audio latent init). Unseeded, "
+                            "pass 2 invents speech at natural rate and this node compresses it, so "
+                            "held regions come back rushed - keep the original. Seeded, pass 2 really "
+                            "did perform slowly, so the retime is valid"}),
+        }}
+
+    RETURN_TYPES = ("AUDIO",)
+    FUNCTION = "recover"
+    CATEGORY = "audio/ltx23/motion"
+
+    def recover(self, audio, hold_map, fps=25, reference=None, reference_mix=1.0,
+                audio_source="custom (use reference_mix)"):
+        import math
+
+        if not hold_map.strip():
+            raise ValueError(
+                "LTX23AudioRecover requires hold_map_used from LTX23TimeSmear"
+            )
+        if audio_source in self.SOURCES:          # words win over the raw dial
+            reference_mix = self.SOURCES[audio_source]
+
+        torchaudio = _torchaudio("phase_vocoder")
+
+        data = json.loads(hold_map)
+        holds = [int(h) for h in data["holds"]]
+        if not holds or any(h < 1 for h in holds):
+            raise ValueError("hold map entries must be positive integers")
+
+        wav = audio["waveform"].detach().float().cpu()   # [B, C, N]
+        sr = audio["sample_rate"]
+        b, c, n = wav.shape
+        x = wav.reshape(b * c, n)
+
+        runs = []                                        # consecutive equal holds
+        for h in holds:
+            if runs and runs[-1][0] == h:
+                runs[-1][1] += 1
+            else:
+                runs.append([h, 1])
+
+        n_fft, hop = 2048, 512
+        window = torch.hann_window(n_fft)
+        phase_adv = torch.linspace(0, math.pi * hop, n_fft // 2 + 1)[..., None]
+        spf = sr / float(fps)                            # samples per frame
+        xfade = max(1, int(round(0.005 * sr)))           # 5 ms crossfade
+        segs, joins, cursor = [], [], 0.0
+        prev_tgt = 0
+        for h, count in runs:
+            src = h * count * spf
+            # exact world-clock samples this run must occupy (see MAINodes
+            # motion.py: keeping targets on the rounded world lattice stops
+            # hop-quantized istft errors from accumulating into a drift that
+            # audibly doubles impacts at mid reference_mix values).
+            tgt = int(round(count * spf))
+            s0, s1 = int(round(cursor)), int(round(cursor + src))
+            cursor += src
+            # pre-roll for the crossfade into the previous run: f output
+            # samples cost f*h source samples, taken from BEFORE s0, so both
+            # sides of the join carry the same material at their own rate
+            # and nothing is dropped. It lands ON TOP of the previous
+            # segment's tail, so output length is exactly sum(tgt).
+            f = 0 if not segs else min(xfade, tgt, prev_tgt, s0 // max(h, 1))
+            prev_tgt = tgt
+            seg = x[:, s0 - f * h:min(s1, n)]
+            if seg.shape[1] == 0:
+                # source exhausted: hold the clock with silence instead of
+                # silently shortening every later segment's position
+                segs.append(torch.zeros(x.shape[0], tgt))
+                joins.append(0)
+                continue
+            if h > 1:
+                spec = torch.stft(seg, n_fft, hop, window=window,
+                                  return_complex=True)
+                spec = torchaudio.functional.phase_vocoder(
+                    spec, _vocoder_rate_for(spec, float(h), hop, f + tgt), phase_adv)
+                # length= is load-bearing: without it istft returns a
+                # hop-multiple that falls short of the target and the pad
+                # below appends digital silence at every held run's tail.
+                seg = torch.istft(spec, n_fft, hop, window=window,
+                                  length=f + tgt)
+            if seg.shape[1] < f + tgt:
+                seg = torch.nn.functional.pad(seg, (0, f + tgt - seg.shape[1]))
+            segs.append(seg[:, :f + tgt])
+            joins.append(f)
+        parts = []
+        for seg, f in zip(segs, joins):
+            if f:
+                # equal-power crossfade: the two takes of this material are
+                # retimed at different rates, so they sum incoherently
+                t = torch.arange(1, f + 1, dtype=seg.dtype) / f
+                prev = parts[-1].clone()                 # never write into x
+                prev[:, -f:] = (prev[:, -f:] * torch.cos(t * (math.pi / 2))
+                                + seg[:, :f] * torch.sin(t * (math.pi / 2)))
+                parts[-1] = prev
+            parts.append(seg[:, f:])
+        y = torch.cat(parts, dim=1)
+        if reference is None and reference_mix > 0:
+            print(f"[LTX23AudioRecover] reference_mix={reference_mix} but no "
+                  "reference audio is wired: the mix does NOTHING and the "
+                  "output is pure regenerated audio. Wire the baseline's "
+                  "audio into 'reference' to blend it back in")
+        if reference is not None and reference_mix > 0:
+            ref = reference["waveform"].detach().float().cpu().reshape(
+                -1, reference["waveform"].shape[-1])
+            if reference["sample_rate"] != sr:
+                _ta = _torchaudio("resample")
+                ref = _ta.functional.resample(ref, reference["sample_rate"], sr)
+            n_out = min(y.shape[1], ref.shape[1])
+            if ref.shape[0] != y.shape[0]:
+                ref = ref[:1].expand(y.shape[0], -1)
+            y = (1 - reference_mix) * y[:, :n_out] + reference_mix * ref[:, :n_out]
+        return ({"waveform": y.reshape(b, c, -1).contiguous(), "sample_rate": sr},)
+
+
 NODE_CLASS_MAPPINGS = {
     "LTX23JerkOracle": LTX23JerkOracle,
     "LTX23TimeSmear": LTX23TimeSmear,
     "LTX23ExactRecover": LTX23ExactRecover,
+    "LTX23AudioRecover": LTX23AudioRecover,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LTX23JerkOracle": "LTX 2.3 Jerk Oracle",
     "LTX23TimeSmear": "LTX 2.3 Time Smear",
     "LTX23ExactRecover": "LTX 2.3 Exact Recover",
+    "LTX23AudioRecover": "LTX 2.3 Audio Recover",
 }
