@@ -1034,7 +1034,7 @@ class LTX23AudioRecover:
                   "reference audio is wired: the mix does NOTHING and the "
                   "output is pure regenerated audio. Wire the baseline's "
                   "audio into 'reference' to blend it back in")
-        if reference is not None and reference_mix > 0:
+        if reference is not None:
             ref = reference["waveform"].detach().float().cpu().reshape(
                 -1, reference["waveform"].shape[-1])
             if reference["sample_rate"] != sr:
@@ -1042,6 +1042,7 @@ class LTX23AudioRecover:
                 ref = _ta.functional.resample(ref, reference["sample_rate"], sr)
             if ref.shape[0] != y.shape[0]:
                 ref = ref[:1].expand(y.shape[0], -1)
+            _sync_report(y, ref, sr, tag="pre-mix")
             if not retime and reference_mix >= 1.0:
                 # Passthrough + full reference: return reference at its own
                 # length so VAE-quantised audio does not silently truncate the
@@ -1056,6 +1057,52 @@ class LTX23AudioRecover:
                 n_out = min(y.shape[1], ref.shape[1])
                 y = (1 - reference_mix) * y[:, :n_out] + reference_mix * ref[:, :n_out]
         return ({"waveform": y.reshape(b, c, -1).contiguous(), "sample_rate": sr},)
+
+
+def _sync_report(y, ref, sr, tag=""):
+    """Objective A/V-sync metric: how well does the retimed regenerated
+    track line up with the original reference?
+
+    Compares 20 ms loudness envelopes (waveform correlation is destroyed by
+    phase differences between two takes; envelope shape survives). Reports
+    Pearson correlation at zero lag and the best lag within +-500 ms. Read
+    it as: corr >= 0.6 and |lag| <= ~40 ms  -> timing is as good as two
+    different takes get; large |lag| -> systematic offset (retime or mux);
+    corr near 0 even at best lag -> the two takes are different performances
+    (pass 2 re-timed the show; no clock math can fix that, see the
+    audio-smear seeding / pass-2 sigma discussion).
+    """
+    import torch.nn.functional as F
+
+    hop = max(1, int(0.02 * sr))                 # 20 ms envelope frames
+    e_y = F.avg_pool1d(y.abs(), kernel_size=hop, stride=hop).mean(dim=0)
+    e_r = F.avg_pool1d(ref.abs(), kernel_size=hop, stride=hop).mean(dim=0)
+    n = min(e_y.shape[-1], e_r.shape[-1])
+    if n < 25:
+        return
+    e_y, e_r = e_y[:n] - e_y[:n].mean(), e_r[:n] - e_r[:n].mean()
+    std = (e_y.std() * e_r.std()) or 1e-9
+    corr0 = float((e_y * e_r).mean() / std)
+    span = min(25, n // 4)                       # +-500 ms in 20 ms steps
+    e_y_c = e_y - e_y.mean()
+    best_lag, best_corr = 0, corr0
+    for lag in range(1, span):
+        if lag >= n // 2:
+            break
+        a = e_y_c[lag:]
+        b = e_r[:n - lag] - e_r[:n - lag].mean()
+        c = float((a * b).mean() / ((a.std() * b.std()) or 1e-9))
+        if c > best_corr:
+            best_corr, best_lag = c, lag
+    # negative lag = the recovered track leads the reference (it starts
+    # early); positive = it lags (it starts late).
+    sign = -1 if best_corr <= corr0 else 1
+    print(f"[LTX23AudioRecover] sync check {tag}: envelope corr at 0 lag = "
+          f"{corr0:.3f}; best corr = {best_corr:.3f} at "
+          f"{sign * best_lag * 0.02:+.2f} s "
+          f"({'recovered track is EARLY' if sign * best_lag * 0.02 < 0 else 'recovered track is LATE' if sign * best_lag * 0.02 > 0 else 'no offset'})"
+          f"{'  -> GOOD sync' if best_corr >= 0.6 and abs(best_lag * 0.02) <= 0.06 else '  -> POOR sync: see tooltip/sync notes' if best_corr < 0.6 else ''}")
+
 
 
 NODE_CLASS_MAPPINGS = {
