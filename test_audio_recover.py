@@ -44,13 +44,38 @@ def main():
     expect = sum(int(round(c * spf)) for _, c in runs)
 
     out, = node.recover({"waveform": wav, "sample_rate": SR}, hm, fps=FPS,
+                        fps_mode="manual (use fps below)",
                         reference=None, reference_mix=0.0)
     got = out["waveform"].shape[-1]
     assert got == expect, f"retimed length {got} != world target {expect}"
-    print(f"PASS length: retimed {got} samples == world clock exactly")
+    print(f"PASS length (manual): retimed {got} samples == world clock exactly")
+
+    # auto mode: audio decoded on a slightly different clock (padded to a
+    # 1024-sample latent multiple) must still retime to the world target and
+    # detect the implied fps.
+    n_pad = ((n_src // 1024) + 1) * 1024
+    wav_pad = torch.zeros(1, 2, n_pad)
+    for f in range(sum(holds)):
+        i = int(f * (n_pad / sum(holds)))
+        wav_pad[:, :, i:i + 40] = 1.0
+    out_a, = node.recover({"waveform": wav_pad, "sample_rate": SR}, hm,
+                          fps=25, fps_mode="auto (match audio to hold map)",
+                          reference=None, reference_mix=0.0)
+    got_a = out_a["waveform"].shape[-1]
+    assert abs(got_a - expect) <= len(holds), (
+        f"auto-mode retime {got_a} != world target {expect}")
+    print(f"PASS auto clock: padded audio {n_pad} -> retimed {got_a} "
+          f"(target {expect})")
+
+    # manual mode with a wrong fps must fire the drift warning
+    node.recover({"waveform": wav, "sample_rate": SR}, hm, fps=50,
+                 fps_mode="manual (use fps below)",
+                 reference=None, reference_mix=0.0)
+    print("PASS manual fps-mismatch warning executed (see console above)")
 
     ref = torch.randn(1, 2, int(round(len(holds) * spf)))
     out2, = node.recover({"waveform": wav, "sample_rate": SR}, hm, fps=FPS,
+                         fps_mode="manual (use fps below)",
                          reference={"waveform": ref, "sample_rate": SR},
                          reference_mix=1.0)
     n_out = out2["waveform"].shape[-1]
@@ -59,6 +84,7 @@ def main():
     print(f"PASS identity: mix=1.0 == reference[:{n_out}] bit-for-bit")
 
     node.recover({"waveform": wav, "sample_rate": SR}, hm, fps=FPS,
+                 fps_mode="manual (use fps below)",
                  reference=None, reference_mix=1.0)
     print("PASS warning path executed (see console line above)")
 

@@ -685,9 +685,13 @@ class LTX23AudioRecover:
             "audio": ("AUDIO",),
             "hold_map": ("STRING", {
                 "default": "",
-                "tooltip": "hold_map_used from the same LTX23TimeSmear node.",
+                "tooltip": "hold_map_used from the same LTX23TimeSmear node (NOT the raw LTX23JerkOracle.hold_map - the smear aligns it to the image batch and snaps the tail to the legal 8k+1 grid, so the audio must retime off the SAME map the video used).",
             }),
-            "fps": ("INT", {"default": 25, "min": 1, "max": 120}),
+            "fps_mode": (["auto (match audio to hold map)", "manual (use fps below)"],
+                {"default": "auto (match audio to hold map)",
+                 "tooltip": "auto derives samples-per-frame from the decoded audio's ACTUAL length and the hold map, so the retime stays in sync even if the fps widget or the decode clock is off. Manual uses fps verbatim and reports any mismatch."}),
+            "fps": ("INT", {"default": 25, "min": 1, "max": 120,
+                            "tooltip": "Used only in manual fps_mode. Must equal the frame rate of the LTX generation (25 for 25fps renders, 50 for 50fps renders)."}),
         }, "optional": {
             "reference": ("AUDIO", {"tooltip": "baseline clip audio (already real-time)"}),
             "reference_mix": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0,
@@ -709,7 +713,8 @@ class LTX23AudioRecover:
     FUNCTION = "recover"
     CATEGORY = "audio/ltx23/motion"
 
-    def recover(self, audio, hold_map, fps=25, reference=None, reference_mix=1.0,
+    def recover(self, audio, hold_map, fps_mode="auto (match audio to hold map)",
+                fps=25, reference=None, reference_mix=1.0,
                 audio_source="custom (use reference_mix)"):
         import math
 
@@ -726,11 +731,62 @@ class LTX23AudioRecover:
         holds = [int(h) for h in data["holds"]]
         if not holds or any(h < 1 for h in holds):
             raise ValueError("hold map entries must be positive integers")
+        total_holds = sum(holds)
 
         wav = audio["waveform"].detach().float().cpu()   # [B, C, N]
         sr = audio["sample_rate"]
         b, c, n = wav.shape
         x = wav.reshape(b * c, n)
+
+        # Clock discipline. The retiming assumes the audio's samples-per-frame
+        # equals sr/fps. Two things break that in an LTX pipeline: the fps
+        # widget not matching the render rate, and LTX's audio decoder
+        # emitting on its own clock (its duration is a latent-token multiple,
+        # not exactly sum(holds)/fps). Auto mode derives spf from the ACTUAL
+        # waveform length: n samples cover total_holds world frames, so
+        # spf = n/total_holds. That guarantees the run boundaries inside the
+        # waveform land where the map says, whatever the decode clock did.
+        # Manual mode uses sr/fps verbatim and reports any drift.
+        manual = fps_mode.startswith("manual")
+        spf = sr / float(fps) if manual else n / float(total_holds)
+        expected = total_holds * spf
+        drift_ms = (n - expected) / sr * 1000.0
+        eff_fps = sr / spf
+        if manual and abs(drift_ms) > 20.0:
+            print(f"[LTX23AudioRecover] WARNING: audio is {n} samples "
+                  f"({n / sr:.3f} s) but the hold map at fps={fps} expects "
+                  f"{int(round(expected))} samples ({expected / sr:.3f} s): "
+                  f"{drift_ms:+.1f} ms drift. Every segment boundary is "
+                  f"misplaced - this desyncs lipsync. Either use fps_mode=auto "
+                  f"or set fps to {eff_fps:.3f} (the render's real rate)")
+        elif manual:
+            print(f"[LTX23AudioRecover] clock OK: audio {n / sr:.3f} s vs map "
+                  f"{expected / sr:.3f} s at fps={fps} ({drift_ms:+.1f} ms)")
+        else:
+            if abs(spf - sr / float(fps)) > 0.02 * sr / float(fps):
+                print(f"[LTX23AudioRecover] auto clock: decoded audio implies "
+                      f"fps={eff_fps:.3f}, not the widget's {fps}; using the "
+                      f"audio's own clock so segments land on the map")
+            else:
+                print(f"[LTX23AudioRecover] auto clock: audio {n / sr:.3f} s "
+                      f"matches the map at fps={fps:.3f}")
+        # Wiring sanity: if the audio's duration matches the WORLD clock
+        # (len(holds) frames) instead of the DILATED clock (sum(holds)
+        # frames), this is almost certainly the baseline clip's audio or a
+        # decoded-at-world-rate track - compressing it again double-shrinks
+        # it and destroys lipsync.
+        world_spf = n / float(len(holds))
+        if len(holds) != total_holds and abs(
+                total_holds * world_spf - n) > 0.02 * n:
+            print(f"[LTX23AudioRecover] note: audio duration matches the map's "
+                  f"DILATED clock ({total_holds} frames) - expected for "
+                  f"regenerated audio. If you intended the baseline track, "
+                  f"it would instead be {len(holds) / eff_fps:.3f} s here.")
+        print(f"[LTX23AudioRecover] map: {len(holds)} world frames, "
+              f"{total_holds} dilated frames (avg x{total_holds / len(holds):.2f}); "
+              f"audio: {b * c} ch, {n} samples @ {sr} Hz ({n / sr:.3f} s); "
+              f"clock: {'manual' if manual else 'auto'} spf={spf:.3f} "
+              f"(eff fps {eff_fps:.3f})")
 
         runs = []                                        # consecutive equal holds
         for h in holds:
