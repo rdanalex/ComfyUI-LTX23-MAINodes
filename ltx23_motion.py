@@ -944,14 +944,16 @@ class LTX23AudioRecover:
                       f"fps={fps} is the render rate and that this audio "
                       f"comes from VAEDecodeAudio of the REGENERATED latent")
         if retime and "manual" in mode:
-            spf = sr / float(fps)                    # manual: widget clock
+            src_spf = sr / float(fps)      # manual: assume dilated at same fps
+            tgt_spf = sr / float(fps)
         elif retime:
-            spf = n / float(total_holds)             # audio's own clock
+            src_spf = n / float(total_holds)  # audio's own dilated clock
+            tgt_spf = world_samples / float(len(holds))  # world clock (sr/fps corrected)
         print(f"[LTX23AudioRecover] map: {len(holds)} world frames, "
               f"{total_holds} dilated frames (avg x{total_holds / len(holds):.2f}); "
               f"audio: {b * c} ch, {n} samples @ {sr} Hz ({n / sr:.3f} s); "
               f"clock: {clock}"
-              + (f"; spf={spf:.3f}" if retime else ""))
+              + (f"; src_spf={src_spf:.3f} tgt_spf={tgt_spf:.3f}" if retime else ""))
 
         if not retime:
             # The audio is already on the world clock: hands off. Retiming
@@ -974,21 +976,19 @@ class LTX23AudioRecover:
             n_fft, hop = 2048, 512
             window = torch.hann_window(n_fft)
             phase_adv = torch.linspace(0, math.pi * hop, n_fft // 2 + 1)[..., None]
-            # spf was derived above (auto-detect: n/total_holds, manual:
-            # sr/fps) and is the single source of truth for the retiming
-            # below. Do NOT recompute it from the fps widget.
+            # src_spf (dilated) is used to read from the source audio;
+            # tgt_spf (world) is used to compute the output segment length.
             xfade = max(1, int(round(0.005 * sr)))       # 5 ms crossfade
             segs, joins, cursor = [], [], 0.0
             prev_tgt = 0
             for h, count in runs:
-                src = h * count * spf
-                # exact world-clock samples this run must occupy (see MAINodes
-                # motion.py: keeping targets on the rounded world lattice stops
-                # hop-quantized istft errors from accumulating into a drift that
-                # audibly doubles impacts at mid reference_mix values).
-                tgt = int(round(count * spf))
+                src = h * count * src_spf     # dilated audio samples for this run
+                # target: world-clock samples this run must occupy. Use the true
+                # world rate (tgt_spf = sr/fps or world_samples/len(holds)) so
+                # the retimed audio duration exactly matches the video.
+                tgt = int(round(count * tgt_spf))
                 s0, s1 = int(round(cursor)), int(round(cursor + src))
-                cursor += src
+                cursor += src  # advance cursor in dilated source space
                 # pre-roll for the crossfade into the previous run: f output
                 # samples cost f*h source samples, taken from BEFORE s0, so both
                 # sides of the join carry the same material at their own rate
@@ -996,7 +996,7 @@ class LTX23AudioRecover:
                 # segment's tail, so output length is exactly sum(tgt).
                 f = 0 if not segs else min(xfade, tgt, prev_tgt, s0 // max(h, 1))
                 prev_tgt = tgt
-                seg = x[:, max(0, s0 - f * h):min(s1, n)]
+                seg = x[:, max(0, s0 - f * h):min(s1, x.shape[1])]
                 if seg.shape[1] == 0:
                     # source exhausted: hold the clock with silence instead of
                     # silently shortening every later segment's position
