@@ -26,9 +26,9 @@ There is a synthetic regression test for the audio recover node (needs torch + t
 python test_audio_recover.py
 ```
 
-# Working lipsync configuration (proven)
+# Working lipsync configuration
 
-`workflows/LTX-2.5_new - AIO (working lipsync config).json` is a full working example. The recipe that made lipsync work:
+The recipe that made lipsync work (the full AIO workflow is still work-in-progress and not yet in the repo):
 
 1. **De-smear samplers use the canonical heavy schedule**: `0.725, 0.4219, 0.0` with `euler_ancestral` (matching the original `LTX 2.5-SmearRemoval-MSR.json`). A light refiner (e.g. `0.30, 0.18, 0.08, 0.0`) makes pass 2 half-preserve / half-re-time the performance, which breaks lipsync against the original audio.
 2. **Seed pass 2's audio rows with LTX23AudioSmear**: decode pass 1's audio rows, stretch them on the SAME `hold_map_used` as the video, `LTXVAudioVAEEncode` -> `LTXVConcatAVLatent` for pass 2. Then audio and video rows agree on the dilated clock.
